@@ -1,0 +1,219 @@
+"""用多层感知机（MLPClassifier）完成 10 类文本分类。
+
+对照 svm.py 的结构，本脚本输出：
+  1) mlp_tuning_heatmap.png —— 超参数（hidden_layer_sizes × alpha）在验证集上的表现
+  2) mlp_loss_curve.png     —— 训练集 + 验证集两条损失曲线（一张图）
+  3) predictions_mlp.csv    —— 测试集预测结果
+
+调参维度参照 TUNING.md 中对 MLPClassifier 的建议：
+  - hidden_layer_sizes: 单层 (50,)/(100,) 起步，再试更宽 (200,) 或更深 (100, 50)
+  - alpha: L2 正则，区间 [0.0001, 0.001, 0.01, 0.1]
+  - activation: 保持默认 'relu'
+  - max_iter: 默认可能不收敛，这里放大到 300
+
+同时为所有 MLP 加入早停（Early Stopping）：验证损失连续 n_iter_no_change 轮没有
+改善（改善幅度 < tol）就结束训练，并回退到验证损失最优的那一轮权重，
+避免白跑满 max_iter，也避免过拟合。
+"""
+
+from sklearn.neural_network import MLPClassifier
+import util
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics import accuracy_score, f1_score, log_loss
+import numpy as np
+import pandas as pd
+
+import matplotlib
+matplotlib.use("Agg")  # 无图形界面环境下直接存图，避免 plt.show() 阻塞
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# 让图中的中文能正常显示（Windows 常用中文字体）
+plt.rcParams["font.sans-serif"] = ["Microsoft YaHei", "SimHei", "DejaVu Sans"]
+plt.rcParams["axes.unicode_minus"] = False
+
+# 固定随机性，保证结果可复现（MLP 的权重初始化 + Adam 的随机性都靠它）
+np.random.seed(42)
+
+# ── 早停（Early Stopping）设置 ─────────────────────────────
+N_ITER_NO_CHANGE = 10      # 验证损失连续这么多轮没有改善，就停止训练
+TOL = 1e-4                 # 改善幅度小于该值不算“改善”
+VALIDATION_FRACTION = 0.1  # sklearn 内置早停从训练集内部再切出的验证集比例
+MAX_EPOCHS = 200           # 绘图阶段手动早停的轮数上限（防止无限训练）
+
+# 1. 加载数据
+X_train, y_train, X_test_unlabeled = util.load_data()
+
+# 2. 把训练集划分为「训练子集」和「验证集」（分层抽样，验证集占 20%）
+#    验证集只用来挑超参数，不参与向量化器的拟合，避免信息泄漏。
+X_tr, X_val, y_tr, y_val = util.train_valid_split(
+    X_train, y_train, test_size=0.2, random_state=42
+)
+print(f"训练子集: {len(X_tr)} 条, 验证集: {len(X_val)} 条, 测试集: {len(X_test_unlabeled)} 条")
+
+# 3. 只在训练子集上拟合 TF-IDF 向量化器，再转换验证集
+vectorizer = TfidfVectorizer(max_features=5000)
+X_tr_tfidf = vectorizer.fit_transform(X_tr)
+X_val_tfidf = vectorizer.transform(X_val)
+
+# 4. 在验证集上比较不同超参数组合，确定最佳参数
+# hidden_options = [(50,), (100,), (200,), (100, 50)]  # 由小到大：单层 → 更宽 → 更深
+hidden_options = [(50,), (100,), (50,25)]
+alpha_options = [0.001, 0.01, 0.1]           # L2 正则强度
+
+records = []
+best_score, best_params, best_model = -1.0, None, None
+for hidden in hidden_options:
+    for alpha in alpha_options:
+        model = MLPClassifier(
+            hidden_layer_sizes=hidden,
+            alpha=alpha,
+            activation="relu",   # 保持默认，收敛快
+            solver="adam",
+            max_iter=300,        # 上限；早停会在验证损失不再下降时提前结束
+            early_stopping=True,                       # 开启早停
+            n_iter_no_change=N_ITER_NO_CHANGE,
+            tol=TOL,
+            validation_fraction=VALIDATION_FRACTION,   # 内部切出的验证集比例
+            random_state=42,
+        )
+        model.fit(X_tr_tfidf, y_tr)
+        y_val_pred = model.predict(X_val_tfidf)
+        acc = accuracy_score(y_val, y_val_pred)
+        f1 = f1_score(y_val, y_val_pred, average="macro")
+        records.append({
+            "hidden_layer_sizes": str(hidden),
+            "alpha": alpha,
+            "acc": acc,
+            "f1_macro": f1,
+            "n_iter": model.n_iter_,
+        })
+        print(f"hidden={str(hidden):<10} alpha={alpha:<7} "
+              f"val acc={acc:.4f}  f1_macro={f1:.4f}  (n_iter={model.n_iter_})")
+        if f1 > best_score:
+            # 记住最佳模型：它只在「训练子集」上训练过，可用来无泄漏地评估验证集
+            best_score = f1
+            best_params = {"hidden_layer_sizes": hidden, "alpha": alpha}
+            best_model = model
+
+results = pd.DataFrame(records)
+print(f"\n最佳超参数: {best_params}  (验证集 f1_macro={best_score:.4f})\n")
+
+# 4.1 把验证集结果绘制成热力图：行 = hidden_layer_sizes，列 = alpha，数值 = f1_macro
+pivot = results.pivot(index="hidden_layer_sizes", columns="alpha", values="f1_macro")
+pivot = pivot.reindex([str(h) for h in hidden_options])   # 保持由小到大的顺序
+pivot = pivot[alpha_options]
+pivot.columns = [f"{a:g}" for a in pivot.columns]         # alpha 显示成 0.0001 / 0.001 ...
+
+fig, ax = plt.subplots(figsize=(6.5, 4.5))
+sns.heatmap(
+    pivot,
+    annot=True, fmt=".4f", cmap="YlGnBu",
+    vmin=pivot.values.min(), vmax=pivot.values.max(),
+    linewidths=0.5, linecolor="white",
+    cbar_kws={"label": "验证集 F1 (macro)"},
+    ax=ax,
+)
+ax.set_xlabel("alpha (L2 正则)")
+ax.set_ylabel("hidden_layer_sizes")
+ax.set_title("MLP 超参数在验证集上的表现")
+plt.tight_layout()
+plt.savefig("mlp_tuning_heatmap.png", dpi=150)
+plt.close(fig)
+print("热力图已保存: mlp_tuning_heatmap.png\n")
+
+# 5. 绘制「训练 + 验证」损失曲线（含早停）
+#    MLPClassifier 只有 loss_curve_（训练损失），没有现成的验证损失曲线，
+#    所以用 partial_fit 逐 epoch 训练，每轮分别记录两边的交叉熵损失（log loss）。
+#    交叉熵正是 MLP 默认的优化目标，因此两条曲线可以直接对比。
+#    这里手动实现早停：用「验证损失」当监控指标，连续 N_ITER_NO_CHANGE 轮没有
+#    改善（改善幅度 < TOL）就停止，并回退到验证损失最优那一轮的权重。
+mlp_probe = MLPClassifier(
+    hidden_layer_sizes=best_params["hidden_layer_sizes"],
+    alpha=best_params["alpha"],
+    activation="relu",
+    solver="adam",
+    max_iter=1,               # 每次 partial_fit 只走一个 epoch
+    n_iter_no_change=np.inf,  # 关闭 sklearn 内部早停，停不停由下面的手动早停决定
+    random_state=42,
+)
+train_loss, val_loss = [], []
+best_val_loss = np.inf
+best_epoch = 0
+best_weights = None
+no_improve = 0
+
+for epoch in range(1, MAX_EPOCHS + 1):
+    if epoch == 1:
+        mlp_probe.partial_fit(X_tr_tfidf, y_tr, classes=np.unique(y_tr))
+    else:
+        mlp_probe.partial_fit(X_tr_tfidf, y_tr)
+
+    tr = float(log_loss(y_tr, mlp_probe.predict_proba(X_tr_tfidf),
+                        labels=mlp_probe.classes_))
+    va = float(log_loss(y_val, mlp_probe.predict_proba(X_val_tfidf),
+                        labels=mlp_probe.classes_))
+    train_loss.append(tr)
+    val_loss.append(va)
+
+    if va < best_val_loss - TOL:                 # 有实质改善：记录最佳权重
+        best_val_loss, best_epoch, no_improve = va, epoch, 0
+        best_weights = ([c.copy() for c in mlp_probe.coefs_],
+                        [b.copy() for b in mlp_probe.intercepts_])
+    else:                                        # 没改善：计数，够数就停
+        no_improve += 1
+        if no_improve >= N_ITER_NO_CHANGE:
+            print(f"\n早停触发：第 {epoch} 轮验证损失已连续 {N_ITER_NO_CHANGE} 轮未改善，"
+                  f"回退到第 {best_epoch} 轮（val loss={best_val_loss:.4f}）")
+            break
+
+# 回退到验证损失最优的权重
+if best_weights is not None:
+    mlp_probe.coefs_, mlp_probe.intercepts_ = best_weights
+
+print(f"共训练 {len(train_loss)} 个 epoch（最佳 epoch = {best_epoch}）")
+print("训练损失:", [round(v, 4) for v in train_loss])
+print("验证损失:", [round(v, 4) for v in val_loss])
+util.graph(
+    train_loss,
+    path="mlp_loss_curve.png",
+    title="MLP 训练 / 验证损失（含早停）",
+    xlabel="epoch",
+    ylabel="log loss (交叉熵)",
+    val_loss=val_loss,
+    train_label="训练集 (训练子集)",
+    val_label="验证集",
+    mark_epoch=best_epoch,   # 竖线标出验证损失最优 / 早停回退点
+)
+
+# 6. 用最佳超参数在「完整训练集」上重新训练（向量化器也重新在全量训练集上拟合）
+final_vectorizer = TfidfVectorizer(max_features=5000)
+X_train_tfidf = final_vectorizer.fit_transform(X_train)
+X_test_tfidf = final_vectorizer.transform(X_test_unlabeled)
+
+mlp_model = MLPClassifier(
+    hidden_layer_sizes=best_params["hidden_layer_sizes"],
+    alpha=best_params["alpha"],
+    activation="relu",
+    solver="adam",
+    max_iter=300,        # 上限；同样交给早停提前结束
+    early_stopping=True,
+    n_iter_no_change=N_ITER_NO_CHANGE,
+    tol=TOL,
+    validation_fraction=VALIDATION_FRACTION,
+    random_state=42,
+)
+mlp_model.fit(X_train_tfidf, y_train)
+
+# 7. 对测试集进行预测并保存结果（不覆盖 svm.py 的 predictions.csv）
+predictions = mlp_model.predict(X_test_tfidf)
+pd.DataFrame(predictions).to_csv("predictions_mlp.csv", index=False, header=False)
+print(f"\n预测结果已保存: predictions_mlp.csv ({len(predictions)} 条)")
+
+# 7.1 输出「验证集」上的 accuracy（最终版本重训阶段）
+#     说明：`mlp_model` 是在「完整训练集」上重训的，而完整训练集包含验证集，
+#     直接用它评估验证集会信息泄漏。所以这里用只见过训练子集的最佳模型
+#     `best_model` 在验证集上评估，得到可信的泛化估计。
+val_acc = accuracy_score(y_val, best_model.predict(X_val_tfidf))
+print(f"\n[最终模型] 验证集 accuracy = {val_acc:.4f}   "
+      f"(验证集 f1_macro = {best_score:.4f})")
